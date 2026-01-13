@@ -10,7 +10,8 @@ use rustc_hash::FxHashMap;
 use typst::diag::{FileError, FileResult};
 use typst::foundations::{Bytes, Datetime, Dict, IntoValue, Repr};
 use typst::syntax::{
-    FileId, Lines, PathError, Source, VirtualPath, VirtualRoot, VirtualizeError,
+    FileId, Lines, PathError, RootedPath, Source, VirtualPath, VirtualRoot,
+    VirtualizeError,
 };
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
@@ -103,8 +104,8 @@ impl SystemWorld {
 
         let main = if let Some(path) = &input_path {
             // Resolve the virtual path of the main file within the project root.
-            let main_path = VirtualPath::virtualize(&root, path)?;
-            FileId::new(VirtualRoot::Project, main_path)
+            RootedPath::new(VirtualRoot::Project, VirtualPath::virtualize(&root, path)?)
+                .intern()
         } else if matches!(input, Some(Input::Stdin)) {
             // Return the special id of STDIN.
             *STDIN_ID
