@@ -12,7 +12,8 @@ use typst::foundations::Bytes;
 use typst_pdf::PdfStandard;
 use typst_syntax::package::PackageVersion;
 use typst_syntax::{
-    FileId, Lines, Source, VirtualPath, VirtualRoot, is_id_continue, is_ident, is_newline,
+    FileId, Lines, Source, VirtualPath, VirtualRoot, is_id_continue, is_id_start,
+    is_ident, is_newline,
 };
 use unscanny::Scanner;
 
@@ -106,6 +107,14 @@ pub trait TestStage: Into<TestStages> + Display + Copy {}
 bitflags! {
     /// The stages a test in ran through. This combines both compilation targets
     /// and output formats.
+    ///
+    /// Here visual representation of the stage tree:
+    /// ```md
+    ///        ╭─> render
+    /// paged ─┼─> pdf ───> pdftags
+    ///        ╰─> svg
+    /// html  ───> html
+    /// ```
     #[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
     pub struct TestStages: u8 {
         const PAGED = 1 << 0;
@@ -156,6 +165,35 @@ impl TestStages {
             });
         }
         res
+    }
+
+    /// The union the supplied stages and their implied stages.
+    ///
+    /// The `paged` target will test `render`, `pdf`, and `svg` by default.
+    pub fn with_required(&self) -> TestStages {
+        let mut res = *self;
+        for flag in self.iter() {
+            res |= bitflags::bitflags_match!(flag, {
+                TestStages::PAGED => TestStages::empty(),
+                TestStages::RENDER => TestStages::PAGED,
+                TestStages::PDF => TestStages::PAGED,
+                TestStages::PDFTAGS => TestStages::PAGED | TestStages::PDF,
+                TestStages::SVG => TestStages::PAGED,
+                TestStages::HTML => TestStages::empty(),
+                _ => unreachable!(),
+            });
+        }
+        res
+    }
+
+    pub fn parse_one(stage: &str) -> Option<TestStages> {
+        match stage {
+            "paged" => Some(TestStages::PAGED),
+            "pdf" => Some(TestStages::PDF),
+            "pdftags" => Some(TestStages::PDFTAGS),
+            "html" => Some(TestStages::HTML),
+            _ => None,
+        }
     }
 }
 
@@ -308,10 +346,25 @@ impl Display for FileSize {
     }
 }
 
-/// An annotation like `// Error: 2-6 message` in a test.
+/// An annotation like this in a test:
+/// ```txt
+/// // Error: [pdf] "assets/data.json" 2-6 message
+///    ^      ^     ^                  ^
+///    kind  stage  file               range
+/// ```
+/// The stage, file, and range are optional.
+///
+/// More commonly only these parts are present:
+/// ```md
+/// // Error: 2-6 message
+///    ^      ^
+///    kind   range
+/// ```
 pub struct Note {
     pub pos: FilePos,
     pub kind: NoteKind,
+    /// The annotated stages of a note.
+    pub stages: Option<TestStages>,
     /// The file [`Self::range`] belongs to.
     pub file: FileId,
     pub range: Option<Range<usize>>,
@@ -626,28 +679,29 @@ impl<'a> Parser<'a> {
                 self.error("expected a space after an attribute");
             }
 
-            match attr_name {
-                "paged" => self.set_attr(attr_name, &mut stages, TestStages::PAGED),
-                "pdftags" => self.set_attr(attr_name, &mut stages, TestStages::PDFTAGS),
-                "pdfstandard" => {
-                    let Some(param) = attr_params.take() else {
-                        self.error("expected parameter for `pdfstandard`");
-                        continue;
-                    };
-                    pdf_standard = serde_yaml::from_str(param)
-                        .inspect_err(|e| {
-                            self.error(format!("unknown pdf standard `{param}`: {e}"))
-                        })
-                        .ok();
-                }
-                "html" => self.set_attr(attr_name, &mut stages, TestStages::HTML),
-                "large" => self.set_attr(attr_name, &mut flags, AttrFlags::LARGE),
+            if let Some(stage) = TestStages::parse_one(attr_name) {
+                self.set_attr(attr_name, &mut stages, stage);
+            } else {
+                match attr_name {
+                    "pdfstandard" => {
+                        let Some(param) = attr_params.take() else {
+                            self.error("expected parameter for `pdfstandard`");
+                            continue;
+                        };
+                        pdf_standard = serde_yaml::from_str(param)
+                            .inspect_err(|e| {
+                                self.error(format!("unknown pdf standard `{param}`: {e}"))
+                            })
+                            .ok();
+                    }
+                    "large" => self.set_attr(attr_name, &mut flags, AttrFlags::LARGE),
 
-                found => {
-                    self.error(format!(
-                        "expected attribute or closing ---, found `{found}`"
-                    ));
-                    break;
+                    found => {
+                        self.error(format!(
+                            "expected attribute or closing ---, found `{found}`"
+                        ));
+                        break;
+                    }
                 }
             }
 
@@ -702,6 +756,45 @@ impl<'a> Parser<'a> {
         let kind: NoteKind = head.parse().ok()?;
         self.s.eat_if(' ');
 
+        let stages = if self.s.eat_if("[") {
+            let mut stages = TestStages::empty();
+            loop {
+                if !self.s.at(is_id_start) {
+                    self.error("expected annotated stage inside `[]`");
+                    return None;
+                }
+
+                let stage = self.s.eat_while(is_id_continue);
+                match TestStages::parse_one(stage) {
+                    Some(stage) => {
+                        if stages.contains(stage) {
+                            self.error(format!("duplicate annotated stage `{stage}`"));
+                        }
+                        stages.insert(stage);
+                    }
+                    None => self.error(format!("unknown annotated stage `{stage}`")),
+                }
+
+                if self.s.eat_if(',') {
+                    self.s.eat_if(' ');
+                    continue;
+                }
+
+                if self.s.eat_if(']') {
+                    break;
+                } else {
+                    self.error("expected closing `]` after stages");
+                    return None;
+                }
+            }
+
+            self.s.eat_if(' ');
+
+            Some(stages)
+        } else {
+            None
+        };
+
         let mut file = None;
         if self.s.eat_if('"') {
             let path = self.s.eat_until(|c| is_newline(c) || c == '"');
@@ -740,6 +833,7 @@ impl<'a> Parser<'a> {
         Some(Note {
             pos: FilePos::new(self.path, self.line),
             kind,
+            stages,
             file: file.unwrap_or(source.id()),
             range,
             message,
