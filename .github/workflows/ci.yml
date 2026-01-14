@@ -4,7 +4,6 @@ on: [push, pull_request, merge_group]
 env:
   RUSTFLAGS: "-Dwarnings"
   RUSTDOCFLAGS: "-Dwarnings"
-  TYPST_TESTS_EXTENDED: true
   PKG_CONFIG_i686-unknown-linux-gnu: /usr/bin/i686-linux-gnu-pkgconf
 
 jobs:
@@ -28,6 +27,9 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
+        # This was for testing cross platform compatibility, but it might be
+        # nice to test more platforms
+        arch: [amd64, arm64]
         bits: [64]
         include:
           - os: ubuntu-latest
@@ -48,24 +50,26 @@ jobs:
           key: ${{ matrix.bits }}
       - run: cargo test --workspace --no-run ${{ matrix.bits == 32 && '--target i686-unknown-linux-gnu' || '' }}
       - run: cargo test --workspace --no-fail-fast ${{ matrix.bits == 32 && '--target i686-unknown-linux-gnu' || '' }}
-      - name: Upload rendered test output
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tests-rendered-${{ matrix.os }}-${{ matrix.bits }}
-          path: tests/store/render/**
-          retention-days: 3
-      - name: Update test artifacts
+      - name: Generate old live output
         if: failure()
         run: |
-          cargo test --workspace --test tests ${{ matrix.bits == 32 && '--target i686-unknown-linux-gnu' || '' }} -- --update
+          cargo test --workspace --test tests ${{ matrix.bits == 32 && '--target i686-unknown-linux-gnu' || '' }}
           echo 'updated_artifacts=1' >> "$GITHUB_ENV"
-      - name: Upload updated reference output (for use if the test changes are desired)
-        if: failure() && env.updated_artifacts
+
+      - name: Generate diff to merge base
+        if: success()
+        run: |
+          cargo test --workspace --test tests ${{ matrix.bits == 32 && '--target i686-unknown-linux-gnu' || '' }}
+          echo 'updated_artifacts=1' >> "$GITHUB_ENV"
+
+      - name: Upload test store
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: tests-updated-${{ matrix.os }}-${{ matrix.bits }}
-          path: tests/ref/**
+          name: tests-store-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.bits }}
+          path: |
+            tests/store/report.html
+            tests/store/by-hash
           retention-days: 3
 
   checks:
